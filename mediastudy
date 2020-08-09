@@ -1,0 +1,1046 @@
+#!/bin/bash
+
+# Written by Johannes Schirm, May 2020
+
+# mediastudy - a complete workflow for language learning through media.
+# - Bulk processing of series with any amount of episodes or generally split-up media
+# - Audio extraction for background listening in two versions, full and condensed
+#   Full: All audio except selected chapters or start and end trim times (optional)
+#   Condensed: Audio with speech (detected using subtitles) except the above (optional)
+#   Simple, interactive selection of desired chapters and audio and subtitle streams
+#   Adjustable padding per sentence for condensed audio for a less chopped up result
+#   Dynamic audio normalization for better audibility (and a less annoying experience)
+#   Automatic ID3 tagging of audio files for clean import into audio collections
+# - Anki deck creation from media files and subtitles (using substudy by emk)
+#   Automatic subtitle extraction from media file or import of external subtitle file
+#   Linear, static time shift of subtitles not from within (or nearby) media file
+#   Automatic alignment of mistimed subtitles to others (using alass by kaegi)
+#   Custom field output for seamless Anki import with correct mapping on card type
+#   Auto-import into Anki and audio file move e.g. into a cloud-synchronized folder
+# - Subtitle preprocessing (validation and repair) to ensure substudy will parse
+# - Clear intermediate folder structure and efficient file management using hardlinks
+#   This makes previewing the final subtitles and debugging the process easier
+
+HELP_TEXT='
+Usage: mediastudy [OPTIONS]
+By default, the current working directory will be searched for media files.
+The output directory will then also be created in the working directory.
+Without manually specifying steps, the script will perform all steps.
+It will also ask interactively for any information that was not provided.
+Steps: Import, full audio, condensed audio, deck, audio move, deck export.
+With one or more specified, only explicitly specified steps are performed.
+
+The following arguments can be specified:
+-m (--media-path) PATH
+   Path to the directory containing all media files to process with this call.
+   These files are all assumed to belong to the same piece of media.
+   Subtitles need to have the same name as their corresponding media file.
+   If they do not, consider separating them and providing --subtitle-path.
+-s (--subtitle-path) PATH
+   An optional path to an external directory containing just subtitles.
+   A 1:1 mapping of media files onto subtitles will be performed.
+   This allows to use subtitle files with a different naming pattern.
+   However, please ensure that the subtitle files are numbered correctly.
+-o (--output-path) PATH
+   Path to the directory in which the output directory will be created.
+   Please provide an already existing directory, not the final path!
+   (The output directory will be named after the media identifier.)
+-i (--media-id) IDENTIFIER
+   The media identifier, a unique and short name for this piece of media.
+   It should only contain alphanumeric characters and no whitespaces!
+-f (--full-audio)
+    Switch for activating the full audio generation step.
+-c (--condensed-audio)
+   Switch for activating the condensed audio generation step.
+-d (--deck)
+   Switch for activating the deck generation step.
+-a (--move-audio)
+   Switch for activating the step which moves the audio files.
+-e (--anki-export)
+   Switch for activating the step which exports the deck into Anki.
+--intermediates
+   Switch for activating the intermediate file generation (import) step.
+--subtitle-offset VALUE
+   How many seconds (e.g. 4.2) to delay all subtitles in --subtitle-path.
+   This optional argument can correct linear subtitle timing offsets.
+   (Often needed for subtitles from releases with additional inserts.)
+   Positive values delay all subtitles, negative values show them earlier.
+--subtitle-sync VALUE|PATH
+   Try automatic subtitle synchronization with the provided reference.
+   This only works if --subtitle-path is used to provide external subtitles.
+   Use this to align incorrect timings to another, correctly timed language.
+   (It is recommended to check all intermediate files in Media/ afterwards!)
+   (The results of alass depend on the quality of the supplied subtitles.)
+   1. To use one of the internal subtitle tracks of the media as reference:
+   Supply the zero-based subtitle number or -1 to select it interactively.
+   Note that all files of the media are assumed to have the same structure.
+   2. To use an external directory with already correctly timed subtitles:
+   Supply the path to the external directory containing just subtitles.
+   The same logic as in --subtitle-path is applied to map the files.
+   To avoid collisions with 1., specify the path with a trailing /.
+--internal-subtitle
+   Switch for exclusively using subtitles embedded in the media files.
+--trust-subtitles
+   Switch for disabling confirmation of automatic subtitle mappings.
+   Affects the behavior of --subtitle-path and --subtitle-sync.
+--recreate-intermediates
+   Switch for recreating all intermediate files from the source files.
+   This does not alter any of the final audio files and deck files.
+--skip VALUE
+   Skip the first VALUE media and subtitle files.
+--immediate-import
+   Switch for importing Anki decks when they are ready without asking.
+   Imports will not work if Anki is locked, so the default is to ask.
+   Only use this if you are not working in Anki at the same time.
+-h (--help)
+   Switch to show this help.
+'
+
+# The following applications need to be available on the system:
+# ffmpeg and ffprobe, ideally version 4.1.4 or higher.
+# substudy (https://github.com/emk/subtitles-rs/tree/master/substudy)
+# alass (https://github.com/kaegi/alass)
+# (anki, but only if the user requests to export the finished deck.)
+# Other tools used: awk, sed, sort, uniq, tac, tar, md5sum...
+
+# INPUT CONFIGURATION
+VIDEO_EXTENSIONS=(
+	'mkv'
+	'mp4'
+)
+SUBTITLE_EXTENSIONS=(
+	'srt'
+	'ass'
+	'ssa'
+)
+# Whether to keep subtitle lines which contain a ♪.
+SRT_MUSIC=0
+# Whether to keep subtitle text between { and }.
+# (Sometimes used for effects, it just sucks.)
+SRT_CURLY=0
+# Whether to keep subtitle text between ( and ) or （ and ）.
+# (Usually to describe a sound or indicate who is speaking.)
+SRT_PARAN=0
+
+# OUTPUT CONFIGURATION
+ANKI_TAG_PREFIX='Media::'
+ANKI_EXTRA_TAGS='Checking'
+# Comma-separated list defining the output order.
+# 0: Empty, 1: Audio, 4: Image, 5: Sentence,
+# 7: Previous sentence, 9: Next sentence.
+ANKI_FIELD_ORDER='5,0,0,4,1,0,0,7,9'
+# Please configure this path appropriately.
+ANKI_MEDIA_PATH='/home/johannes/.local/share/Anki2/日本語/collection.media/'
+FULL_AUDIO_EXTENSION='.mp3'
+FULL_AUDIO_BITRATE='128k'
+FULL_AUDIO_FILTER='dynaudnorm=f=500:g=3:p=0.5:m=50.0'
+FULL_AUDIO_PATH='/home/johannes/Musik/Immersion/'
+CONDENSED_AUDIO_EXTENSION='.mp3'
+CONDENSED_AUDIO_BITRATE='160k'
+CONDENSED_AUDIO_FILTER='dynaudnorm=f=500:g=5:p=0.5:m=30.0'
+CONDENSED_AUDIO_PATH='/home/johannes/Musik/Immersion/!Condensed/'
+# The minimum amount of milliseconds that subtitles need to last.
+# Use this to balance between irrelevant shouting and lost dialogue.
+CONDENSED_AUDIO_MINIMUM_LENGTH=1000
+# The maximum amount of milliseconds to include before and after subtitles.
+# Higher values will chop dialogues less up and reduce filter complexity.
+CONDENSED_AUDIO_PADDING=800
+
+
+# FUNCTION DEFINITIONS
+function toAlphanumeric {
+	# Outputs a string (argument 1) with any non-alphanumeric characters removed.
+	echo "$1" | tr -dc '[:alnum:]'
+}
+function fileLink {
+	# Tries to create a hardlink (argument 2) that points to a file (argument 1).
+	# If creating a hardlink is not possible, a symbolic link is created.
+	if ! ln "$1" "$2" 2> /dev/null;
+	then
+		ln -s "$1" "$2"
+	fi
+}
+function secondsToMs {
+	# Converts floating point seconds (argument 1) to integer milliseconds.
+	# The input format must use '.' as decimal point, e.g. 4.2.
+	echo "$1" | awk '{ print int($0 * 1000) }'
+}
+function timestampToMs {
+	# Converts a timestamp in sexagesimal format (argument 1) to milliseconds.
+	# Works both with milliseconds and nanoseconds after the last delimiter.
+	# For other formats, please double check the results to prevent errors.
+	echo "$1" | awk -F "[:,.]" '{
+		h = int($1); m = int($2); s = int($3); ms = int(substr($4, 1, 3));
+		print h * 3600000 + m * 60000 + s * 1000 + ms;
+	}'
+}
+function msToTimestamp {
+	# Constructs a timestamp in sexagesimal format from milliseconds (argument 1).
+	# The format is ffmpeg-compatible and takes the form of H:MM:SS.mmm.
+	# (With H not being limited to one digit and mmm for milliseconds.)
+	echo "$1" | awk '{
+		ms = int($0);
+		h = int(ms / 3600000); ms -= h*3600000;
+		m = int(ms / 60000); ms -= m*60000;
+		s = int(ms / 1000); ms -= s*1000;
+		printf "%d:%02d:%02d.%03d", h, m, s, ms;
+	}'
+}
+function selectTargetStream {
+	# Let the user select a specific stream type (argument 2) from a media file (argument 1).
+	# Below the list of available streams, an optional prompt (argument 3) can be shown.
+	# The stream type can for example be v for video, a for audio and s for subtitle.
+	# Make sure to use the result in the form of v:X, a:X, or s:X and not globally!
+	# Displays stream title if available, otherwise language if available, otherwise index.
+	# (uniq it not able to pick the LAST duplicate?! Okay, use tac before and after...)
+	streams=$(ffprobe -v quiet -show_entries stream_tags=title,language:stream=index \
+		-of flat=s=_ -select_streams $2 -i "$1" \
+		| sed "s/^streams_stream_//g" \
+		| sed -E "s/_(tags_title|tags_language|index)=\"?/: /g" \
+		| sed "s/\"\$//g" | tac | uniq --check-chars=3 | tac)
+	if [[ $(echo "$streams" | wc -l) -gt 1 ]]
+	then
+		echo "$streams"
+		if [ ! -z "$3" ]
+		then
+			# A prompt was provided.
+			echo "$3"
+		fi
+		read -p "Select stream number " targetStream
+	else
+		# Select the stream automatically if it is only one.
+		targetStream=0
+	fi
+}
+function selectChapters {
+	# Let the user select a list of chapters from a media file (argument 1).
+	# The usage description (argument 2) should complete the sentence:
+	# "This selection of chapters will be used for..."
+	# (Example: "condensed audio extraction", default: "audio extraction".)
+	# In case all chapters are selected, the character "a" is returned.
+	# This function assumes that chapters are available in the media file.
+	ffprobe -v quiet -of flat=s=_ -sexagesimal -show_chapters \
+		-show_entries chapter=tags_title -i "$1" \
+		| sed "s/^chapters_chapter_//g" \
+		| sed -E "s/_(start_time|end_time|tags_title)=\"/: /g" \
+		| sed "s/\"\$//g"
+	echo "This chapter pattern was found in ${1##*/}."
+	echo "Please enter the chapters that should be used for ${2:-audio extraction}."
+	echo "(Whitespace-free, comma-separated list of numbers or \"a\" to choose all."
+	unset targetChapters
+	while [[ ! $targetChapters =~ ^([0-9]+(,[0-9]+)*|a)$ ]]
+	do
+		read -p "Select chapters " targetChapters
+	done
+}
+function readChapterData {
+	# Extracts chapter metadata from a media file (argument 1).
+	# The output consists of lines alternating between chapter id and value.
+	# Order of values: Start time (sexagesimal), end time (sexagesimal), chapter name.
+	chapterData=$(ffprobe -v quiet -of flat=s=_ -sexagesimal -show_chapters \
+		-show_entries chapter=start_time,end_time,tags_title -i "$1" \
+		| sed "s/^chapters_chapter_//g" \
+		| sed -E "s/_(start_time|end_time|tags_title)=\"/\\n/g" \
+		| sed "s/\"\$//g")
+}
+function getChapterPattern {
+	# Calculates a checksum of the chapter metadata in a media file (argument 1).
+	# Times are excluded, so only chapter names and the total number are considered.
+	# This essentially allows to group by patterns in chapter structures.
+	readChapterData "$1"
+	echo "$chapterData" | grep -v '^.*:.*:.*\..*$' | md5sum | cut -d ' ' -f 1
+}
+function readChapterTimes {
+	# Extracts chapter times from a media file (argument 1) for selected chapters (argument 2).
+	# Argument 2 needs to be a comma-separated list of chapter indices to consider.
+	# (This list can also generally be set to "a", which will consider all.)
+	# Times are in milliseconds since the start of the media file.
+	readChapterData "$1"
+	chapterTimes=$(echo "$chapterData" | {
+		# Interpret the first two values of every chapter as start and end time.
+		# The function readChapterData always outputs this in the same order.
+		value=0
+		read chapter
+		while read line; do
+			if [[ "$value" -lt 2 && "$2" =~ (,|^)$chapter(,|$)|^a$ ]]; then
+				# Convert and write this value since:
+				# 1. This is either a start or end time.
+				# 2. It is for a chapter that was requested.
+				msTime=$(timestampToMs "$line")
+				echo -n "$msTime;"
+			fi
+			let value=value+1
+			if read nextChapter; then
+				if [ ! "$nextChapter" -eq "$chapter" ]; then
+					# A new chapter begins...
+					echo -en "\n"
+					value=0
+					chapter=$nextChapter
+				fi
+			fi
+		done
+	} | sort --field-separator=";" --key=1,1 --numeric-sort | grep .)
+}
+function fixSubtitles {
+	# Fixes inconsitencies in the SubRip subtitle file (argument 1) and outputs the result.
+	# For overlaps, the end of the earlier subtitle is set to the start of the subsequent one.
+	# Of duplicates (with the same start time), the longest (last if duplicate) one is kept.
+	# Subsequent subtitles with exactly the same text are merged into one.
+	# The numbering is performed from scratch and all times are sorted.
+	sed -e ':a' -e 'N' -e '$!ba' -e 's/\r\n/\\N/g' "$1" \
+	| awk -v music="$SRT_MUSIC" -v curly="$SRT_CURLY" -v paran="$SRT_PARAN" 'BEGIN{
+		# Bring subtitles into one line each, delimited by "% ".
+		# The above pain-in-the-ass sed just converts CRLFs into \N.
+		# (This seems to be the only way: https://stackoverflow.com/a/1252191)
+		# This is necessary to bring all subtitle content into field $3.
+		RS = "\n\n"; ORS = "\n";
+		FS = "\n"; OFS = "% ";
+	}{
+		# Do not forget to "escape" real percentages.
+		gsub("%", "%%");
+		# Account for more than two lines between records.
+		# (Just trim whitespaces at the start and end of $0.)
+		gsub("^[[:space:]]+|[[:space:]]+$", "");
+		# If requested, delete text in curly braces or parantheses.
+		# Non-greedy awk: https://unix.stackexchange.com/a/49605
+		if (!curly) {
+			# Iterate through all layers of possibly nested braces...
+			do {
+				replacements = gsub("{[^({|})]*}", "");
+			} while (replacements > 0)
+		}
+		if (!paran) {
+			gsub("(\\(|（)[^(\\)|）)]*(\\)|）)", "");
+		}
+		# Delete any empty lines within subtitle text, they confuse substudy.
+		# (To not interfere with the parsing LFs, CRLFs seem to be used for this.)
+		# (However, it creates a blank line, which is technically against the format!)
+		gsub("\\\\N(\\\\N)+", "\\N", $3);
+		# Make sure to prevent leading or trailing CRLFs in subtitle content:
+		gsub("^(\\\\N)+|(\\\\N)+$", "", $3);
+		# Drop invalid records. (Non-integer number, empty or containing a music note.)
+		# Empty subtitles can arise from the previous step removing all their content.
+		if (match($1, "^[0-9]+$") && (!match($0, "♪") || music) && length($3) > 0) {
+			$1 = ""; print;
+		}
+	}' | sort --stable --key=1.3,1.31 \
+	| awk 'BEGIN{
+		# Bring subtitles back into the original format.
+		RS = "\n"; ORS = "\n\n";
+		FS = "% "; OFS = "\n";
+		# Assign new numbering and write with a delay of one line.
+		# (Detecting interferences with the subsequent subtitle.)
+		id = 1; lastStart = ""; lastEnd = ""; lastRecord = "";
+	}{
+		# Restore any "escaped" percentages.
+		gsub("%%", "%");
+		# Also change any \N replacements back into CRLFs!
+		gsub("\\\\N", "\r\n");
+		# Determine the start and end time of the current subtitle.
+		split($2, times, / --> /);
+		if (times[1] > lastStart) {
+			# This subtitle starts after the previous one.
+			# First, check whether they contain different text.
+			split(lastRecord, lastLines, OFS);
+			differentLines = 0;
+			for (i = 3; i <= NF; i++) {
+				differentLines += ($i != lastLines[i]);
+			}
+			if (differentLines == 0) {
+				# Prolong the last subtitle to the end of this one.
+				# Do not write it yet, just update the last* variables.
+				# It contains the same text, so this one can be ignored.
+				gsub(lastEnd, times[2], lastRecord);
+				lastEnd = times[2];
+			} else {
+				# The subtitles are different, so check for overlaps.
+				if (lastEnd > times[1]) {
+					# Overlap! Shorten to the current start time.
+					gsub(lastEnd, times[1], lastRecord);
+					lastEnd = times[1];
+				}
+				# Write the previous subtitle now.
+				# But only if one has been processed before.
+				if (id > 1) {
+					print lastRecord;
+				}
+				# Store the current subtitle in the last* variables.
+				$1 = id++;
+				lastRecord = $0;
+				lastStart = times[1];
+				lastEnd = times[2];
+			}
+		} else {
+			# Overwrite the last subtitle with the current one.
+			# (It starts at the same time, ignore it in favor of this one...)
+			# (The sorting will make sure that the longest or hindmost is kept.)
+			# Decrease the numbering for this, it has already been advanced!
+			$1 = (id - 1);
+			lastRecord = $0;
+			lastEnd = times[2];
+		}
+	}END{
+		# Because of the delayed print system, one last write is needed here.
+		print lastRecord;
+	}'
+}
+function buildAudioTrimFilter {
+	# Creates an ffmpeg audio filter which takes out specific timespans (argument 1).
+	# One timespan per line. First start time, then end time, semicolon-separated.
+	# The stream to apply this to (argument 2) must be in ffmpeg format, e.g. a:0.
+	# Time values need to be in milliseconds since start of the selected stream.
+	# The "result" stream is named "trimmedAudio" and needs to be mapped manually.
+	echo "$1" | awk -F ";" -v stream="$2" 'BEGIN{
+		outPrefix = stream; gsub(":", "", outPrefix);
+		count = 0;
+	}{
+		# For each timespan, create a corresponding atrim filter.
+		printf "[%s]atrim=start=%f:end=%f,asetpts=PTS-STARTPTS[%s-%d];",
+			stream, int($1) / 1000, int($2) / 1000, outPrefix, count++
+	}END{
+		# At the end, create a big concat filter uniting all intermediate streams.
+		for (i = 0; i < count; i++) {
+			printf "[%s-%d]", outPrefix, i
+		}
+		printf "concat=n=%d:v=0:a=1[trimmedAudio]", count
+	}'
+}
+function importExternalSubtitle {
+	# Imports an external subtitle using its sequence number (argument 1).
+	# The subtitle will be searched in the source directory (argument 2).
+	# Only files with extensions from SUBTITLE_EXTENSIONS will be used.
+	# Files will be naturally sorted by name. The sequence starts at 1.
+	# The subtitle will be written to the target path (argument 3).
+	# If necessary, the user will be asked to confirm the mapping.
+	# For this occasion, a usage description (argument 4) is required.
+	# It should finish the sentence: "Use this external file as..."
+	# (Example: "subtitle during deck creation for media file X")
+	# Exits with status 0 if the subtitle was imported successfully.
+	externalSubtitle=$(ls -v1A "$2" \
+		| { while read file; \
+			do [[ "${SUBTITLE_EXTENSIONS[@]}" =~ "${file##*.}" ]] && echo "$file"; \
+		done } \
+		| sed "$1q;d" 2> /dev/null)
+	if [[ ! -z "$externalSubtitle" ]]
+	then
+		# Ask the user to confirm the mapping for every single external subtitle.
+		# (In their best interest: A faulty mapping will render everything useless.)
+		if [[ ! "$TRUST_SUBTITLES" -eq 1 ]]
+		then
+			defaultUsage="subtitle for media file number $1"
+			read -p "Use \"$externalSubtitle\" as ${4:-$defaultUsage}? y/n: " useSub
+		else
+			useSub="y"
+		fi
+		if [[ "$useSub" != "n" ]]
+		then
+			ffmpeg -v error -itsoffset "$SUBTITLE_OFFSET" \
+				-i "$2/$externalSubtitle" \
+				-c:s text "$3"
+		else
+			unset externalSubtitle
+		fi
+	fi
+	# Let this function only succeed if the file was created.
+	[[ -f "$externalSubtitle" ]]
+}
+
+
+# Determine specific settings for this piece of media.
+# Initialize optional values with their defaults.
+MEDIA_PATH=$(pwd)
+SUBTITLE_OFFSET=0
+SKIP_COUNT=0
+INTERNAL_SUBTITLE=0
+TRUST_SUBTITLES=0
+IMMEDIATE_IMPORT=0
+ALL_STEPS=1
+FULL_AUDIO=0
+CONDENSED_AUDIO=0
+DECK=0
+MOVE_AUDIO=0
+ANKI_EXPORT=0
+# Parse all provided arguments.
+# Great help: https://stackoverflow.com/a/33826763
+while [[ "$#" -gt 0 ]]; do
+	case $1 in
+		-m|--media-path) MEDIA_PATH=$(realpath "$2"); shift ;;
+		-s|--subtitle-path) SUBTITLE_PATH=$(realpath "$2"); shift ;;
+		-o|--output-path) OUTPUT_PATH=$(realpath "$2"); shift ;;
+		-i|--media-id) MEDIA_ID=$(toAlphanumeric "$2"); shift ;;
+		-f|--full-audio) FULL_AUDIO=1; ALL_STEPS=0 ;;
+		-c|--condensed-audio) CONDENSED_AUDIO=1; ALL_STEPS=0 ;;
+		-d|--deck) DECK=1; ALL_STEPS=0 ;;
+		-a|--move-audio) MOVE_AUDIO=1; ALL_STEPS=0 ;;
+		-e|--anki-export) ANKI_EXPORT=1; ALL_STEPS=0 ;;
+		--intermediates) ALL_STEPS=0 ;;
+		--subtitle-offset) SUBTITLE_OFFSET="$2"; shift ;;
+		--subtitle-sync) SUBTITLE_REFERENCE="$2"; shift ;;
+		--internal-subtitle) INTERNAL_SUBTITLE=1 ;;
+		--trust-subtitles) TRUST_SUBTITLES=1 ;;
+		--recreate-intermediates) REBUILD_OUTPUT=1 ;;
+		--skip) SKIP_COUNT="$2"; shift ;;
+		--immediate-import) IMMEDIATE_IMPORT=1 ;;
+		-h|--help) echo "$HELP_TEXT"; exit 0 ;;
+		*) echo "Unknown parameter passed: $1"; exit 1 ;;
+	esac
+	shift
+done
+# Activate all steps if no specific step was requested.
+if [[ "$ALL_STEPS" -eq 1 ]]
+then
+	FULL_AUDIO=1
+	CONDENSED_AUDIO=1
+	DECK=1
+	MOVE_AUDIO=1
+	ANKI_EXPORT=1
+fi
+# Get the absolute path of the reference subtitle directory.
+# (If it is a directory and not a stream index, it can be both!)
+if [[ -d "$SUBTITLE_REFERENCE" ]]
+then
+	SUBTITLE_REFERENCE=$(realpath "$SUBTITLE_REFERENCE")
+fi
+
+
+# First, prepare any necessary intermediate files in the output directory.
+if [[ ! -z "$OUTPUT_PATH" && -d "$OUTPUT_PATH" ]];
+then
+	# A different output directory was specified, change into it.
+	cd "$OUTPUT_PATH"
+fi
+# Interactively ask for the media identifier if it was not already provided.
+while [ -z "$MEDIA_ID" ]
+do
+	echo "Please enter a unique media identifier using only alphanumeric characters:"
+	read MEDIA_ID
+	# Make sure the user really types in an identifier that makes sense.
+	# (Important! This will be used in Anki tags and media files...)
+	MEDIA_ID=$(toAlphanumeric "$MEDIA_ID")
+done
+# Delete intermediate files (for recreation) if requested by the user.
+if [[ "$REBUILD_OUTPUT" -eq 1 ]]
+then
+	rm "$MEDIA_ID"/Media/*.* "$MEDIA_ID"/Subtitles/*
+fi
+# Prepare the output directory for this piece of media in the working directory.
+# (If it already exists and recreation was not requested, skip this step.)
+if [[ ! -d "./$MEDIA_ID" || "$REBUILD_OUTPUT" -eq 1 ]]
+then
+	# Make sure the expected directory structure is available.
+	mkdir $MEDIA_ID 2> /dev/null
+	cd $MEDIA_ID
+	mkdir "Media" "Subtitles" "Audio" "Audio/Condensed" "collection.media" 2> /dev/null
+	# Create media links (non-destructive naming) and prepare the SRT files.
+	IFS=$'\n'
+	i=1
+	for file in $(ls -v1A "$MEDIA_PATH" 2> /dev/null)
+	do
+		filename="${file%.*}"
+		extension="${file##*.}"
+		if [[ "${VIDEO_EXTENSIONS[@]}" =~ "${extension}" ]]
+		then
+			if [[ $i -le "$SKIP_COUNT" ]]
+			then
+				# Skip this media file.
+				let i=i+1
+				continue
+			fi
+			# Determine the new paths for media and subtitle files.
+			targetID=$(printf "$MEDIA_ID%04d" "$i")
+			targetMediaPath="Media/$targetID.$extension"
+			targetSubtitlePath="Subtitles/$targetID.srt"
+			echo "Analyzing files for $targetID..."
+			# Just create a correctly named link to the media file.
+			fileLink "$MEDIA_PATH/$file" "$targetMediaPath"
+			# Find out where to get the subtitle file from...
+			if [[ ! -z "$SUBTITLE_PATH" ]]
+			then
+				# First choice is the user-provided (external) subtitle directory.
+				# We traverse media files in natural order, so $i is used as sequence number.
+				importExternalSubtitle "$i" "$SUBTITLE_PATH" "$targetSubtitlePath" \
+					"subtitle for \"$file\""
+			fi
+			if [[ -z "$externalSubtitle" ]]
+			then
+				if [[ -f "$MEDIA_PATH/$filename.srt" && ! "$INTERNAL_SUBTITLE" -eq 1 ]]
+				then
+					# Simplest option: There is already an SRT subtitle present.
+					# (Only use it if usage of internal subtitles was not forced.)
+					echo "SubRip subtitle found for $targetID."
+					# Use ffmpeg even if the subtitle is already in SRT format.
+					# This validates it and (with -c:s text) removes formatting.
+					# (Important, since we might get problems with XML tags..!)
+					ffmpeg -v error -i "$MEDIA_PATH/$filename.srt" \
+						-c:s text "$targetSubtitlePath"
+				else
+					# Convert from a different format or extract from the media file.
+					# First, check for different formats with the same filename.
+					for subExt in "${SUBTITLE_EXTENSIONS[@]}"
+					do
+						if [[ -f "$MEDIA_PATH/$filename.$subExt" ]]
+						then
+							# Use the first available alternative format.
+							subtitlePath="$MEDIA_PATH/$filename.$subExt"
+							break
+						fi
+					done
+					if [[ ! -z "$subtitlePath" && ! "$INTERNAL_SUBTITLE" -eq 1 ]]
+					then
+						# Convert the alternative format into an SRT file.
+						# (Only use it if usage of internal subtitles was not forced.)
+						echo "Alternative subtitle found for $targetID."
+						ffmpeg -v error -i "$subtitlePath" -c:s text "$targetSubtitlePath"
+					else
+						# The subtitle has to be extracted from the media file.
+						if [[ -z "$subtitleStream" ]]
+						then
+							# No subtitle stream was selected before, ask once.
+							# (It is assumed to be the same for this piece of media.)
+							selectTargetStream "$targetMediaPath" s \
+								"Specify the desired subtitle stream:"
+							subtitleStream=$targetStream
+						fi
+						ffmpeg -v quiet -i "$targetMediaPath" -map "s:$subtitleStream" \
+							-c:s text "$targetSubtitlePath"
+						if [[ -f "$targetSubtitlePath" ]]
+						then
+							# The embedded subtitle was extracted successfully!
+							echo "Embedded subtitle found for $targetID."
+						else
+							# No subtitle is available for this file, ignore it.
+							echo "No subtitle found, ignoring \"$file\"."
+							rm "$targetMediaPath"
+							continue
+						fi
+					fi
+				fi
+			fi
+			# Now make sure the subtitle is ready to be processed for our purposes.
+			# To get the best results, fix any inconsistencies in its contents.
+			fixedSubtitlePath="${targetSubtitlePath%.srt}.fixed.srt"
+			fixSubtitles "$targetSubtitlePath" > "$fixedSubtitlePath"
+			# Also clean the subtitle using the integrated feature of substudy.
+			cleanedSubtitlePath="${targetSubtitlePath%.srt}.cleaned.srt"
+			substudy clean "$fixedSubtitlePath" > "$cleanedSubtitlePath"
+			# Finally, try to align the subtitle to a reference if requested by the user.
+			finalSubtitlePath="$cleanedSubtitlePath"
+			if [[ ! -z "$SUBTITLE_REFERENCE" ]]
+			then
+				# Fetch the reference file, either from inside the media file or a directory.
+				referenceSubtitlePath="${targetSubtitlePath%.srt}.reference.srt"
+				if [[ "$SUBTITLE_REFERENCE" =~ ^-?[0-9]+$ ]]
+				then
+					if [[ "$SUBTITLE_REFERENCE" -eq -1 ]]
+					then
+						# Ask for the reference subtitle track interactively.
+						# (Once, it is assumed to be the same for this piece of media.)
+						selectTargetStream "$targetMediaPath" s \
+							"Specify the reference subtitle stream for alignment:"
+						SUBTITLE_REFERENCE=$targetStream
+					fi
+					# Extract the reference subtitle from the media file.
+					ffmpeg -v quiet -i "$targetMediaPath" -map "s:$SUBTITLE_REFERENCE" \
+						-c:s text "$referenceSubtitlePath"
+				else
+					# Copy the reference subtitle from the provided external directory.
+					importExternalSubtitle "$i" "$SUBTITLE_REFERENCE" \
+						"$referenceSubtitlePath" \
+						"reference to align the above subtitle to"
+                                fi
+				if [[ -f "$referenceSubtitlePath" ]]
+				then
+					# Fix the reference subtitle to avoid problems during alignment.
+					fixedReferenceSubtitlePath="${referenceSubtitlePath%.srt}.fixed.srt"
+					fixSubtitles "$referenceSubtitlePath" > "$fixedReferenceSubtitlePath"
+					# Let alass perform the alignment with default settings.
+					alignedSubtitlePath="${targetSubtitlePath%.srt}.aligned.srt"
+					if alass "$fixedReferenceSubtitlePath" "$finalSubtitlePath" \
+						"$alignedSubtitlePath" | grep -e '^shifted .* by .*$'
+					then
+						# The alignment succeeded, use the result!
+						finalSubtitlePath="$alignedSubtitlePath"
+					else
+						echo "Subtitle for $targetID could not be aligned."
+					fi
+				else
+					echo "No reference subtitle for $targetID, skipping alignment."
+				fi
+			fi
+			# Create link next to media file, so e.g. VLC displays the processed subtitle.
+			fileLink "$finalSubtitlePath" "Media/$targetID.srt"
+			let i=i+1
+		fi
+	done
+	unset IFS
+else
+	cd $MEDIA_ID
+fi
+# Warn the user if there are media files with untagged audio channels.
+# (This will probably result in substudy choosing the wrong channel.)
+IFS=$'\n'
+for file in $(ls -1A "./Media/" 2> /dev/null)
+do
+	langTags=$(ffprobe -v quiet -show_entries stream_tags=language:stream=index \
+		-of flat=s=_ -select_streams a -i "Media/$file")
+	indexCount=$(echo "$langTags" | grep '_index=' | wc -l)
+	langCount=$(echo "$langTags" | grep '_language=' | wc -l)
+	engCount=$(echo "$langTags" | grep '_language="eng"' | wc -l)
+	# Decide whether to warn the user. Check if all audio streams have a language tag.
+	# (This is done by comparing the number of streams to the number of language tags.)
+	# But, ffprobe sucks a bit and will default to English in none is present.
+	# To be safe, warn if there is more than one English audio stream...
+	if [[ ! "$indexCount" -eq "$langCount" || "$engCount" -gt 1 ]]
+	then
+		showLangWarning=1
+		echo "$file"
+	fi
+done
+unset IFS
+if [[ ! -z "$showLangWarning" ]]
+then
+	echo "The above files are likely to miss some language metadata in their audio streams."
+	echo "(For reasons, more than one English subtitle track also leads to this warning.)"
+	echo "It is recommended to at least tag your target language e.g. using MKVToolNix."
+	echo "Otherwise, substudy might not be able to choose the correct deck audio."
+	if [[ "$DECK" -eq 1 ]]
+	then
+		echo "Once the files are ready to be processed further, please press enter."
+		read
+	fi
+fi
+# Find the first media file, which will sometimes represent all media files.
+firstMediaFile="Media/$(ls -1A ./Media/ | head -n 1 2> /dev/null)"
+if [[ -z "$firstMediaFile" ]]
+then
+	echo "No media files were selected. Please try recreating intermediate files."
+	exit 1
+fi
+# Determine which audio stream should be used for which purpose.
+if [[ "$FULL_AUDIO" -eq 1 ]]
+then
+	selectTargetStream "$firstMediaFile" a \
+		"Please select the audio stream that should be used for full audio:"
+	audioStreamFull=$targetStream
+fi
+if [[ "$CONDENSED_AUDIO" -eq 1 ]]
+then
+	selectTargetStream "$firstMediaFile" a \
+		"Please select the audio stream that should be used for condensed audio:"
+	audioStreamCondensed=$targetStream
+fi
+# Determine which parts of the media files should be extracted for which purpose.
+# (For example, removing openings and credits makes for more efficient studies.)
+if [[ "$FULL_AUDIO" -eq 1 || "$CONDENSED_AUDIO" -eq 1 ]]
+then
+	readChapterData "$firstMediaFile"
+	if [[ ! -z "$chapterData" ]]
+	then
+		# The media files provide chapter markers, ask the user which should be used.
+		# Do this for all patterns of chapter markers, as they probably differ too much.
+		# (This is accomplished by determining the md5sum of the full chapter data.)
+		declare -A chaptersFull
+		declare -A chaptersCondensed
+		IFS=$'\n'
+		for file in $(ls -1A "./Media/" 2> /dev/null)
+		do
+			if [[ "$file" =~ \.srt$ ]]
+			then
+				# Ignore the (link to the) cleaned subtitle, which is in the same folder.
+				continue
+			fi
+			chapterPattern=$(getChapterPattern "Media/$file")
+			if [[ -z "${chaptersFull[$chapterPattern]}" && \
+				-z "${chaptersCondensed[$chapterPattern]}" ]]
+			then
+				# This pattern of chapters (including names) is not known yet.
+				selectChapters "Media/$file" "full audio extraction"
+				if [[ "$FULL_AUDIO" -eq 1 && "$CONDENSED_AUDIO" -eq 1 ]]
+				then
+					chaptersFull[$chapterPattern]=$targetChapters
+					# Find out if the same restrictions should be applied to condensed audio.
+					read -p "Does this selection also apply to condensed audio? y/n: " conSame
+					if [[ "$conSame" != "y" ]]
+					then
+						selectChapters "Media/$file" "condensed audio extraction"
+						chaptersCondensed[$chapterPattern]=$targetChapters
+					else
+						chaptersCondensed[$chapterPattern]=${chaptersFull[$chapterPattern]}
+					fi
+				elif [[ "$FULL_AUDIO" -eq 1 ]]
+				then
+					# Only full audio will be needed.
+					chaptersFull[$chapterPattern]=$targetChapters
+				else
+					# Only condensed audio will be needed.
+					chaptersCondensed[$chapterPattern]=$targetChapters
+				fi
+			fi
+		done
+		unset IFS
+	else
+		# No chapter markers available. Fall back to static start and end trim times.
+		startTrimMs=0; endTrimMs=0;
+		echo "No chapter markers are available for this piece of media."
+		read -p "Would you like to enter static start and end trim times? y/n: " conTrim
+		if [[ "$conTrim" != "n" ]]
+		then
+			echo "Please enter in seconds, for example 42, 6.8 or 120."
+			read -p "Seconds to trim at the start: " startTrimSecs
+			startTrimMs=$(secondsToMs "$startTrimSecs")
+			read -p "Seconds to trim at the end: " endTrimSecs
+			endTrimMs=$(secondsToMs "$endTrimSecs")
+		fi
+	fi
+fi
+# Now, extract the full and condensed audio from all linked media files.
+IFS=$'\n'
+for file in $(ls -1A "./Media/" 2> /dev/null)
+do
+	if [[ "$file" =~ \.srt$ ]]
+	then
+		# Ignore the (link to the) cleaned subtitle, which is in the same folder.
+		continue
+	fi
+	# Determine the length of the media file in milliseconds.
+	mediaLengthMs=$(secondsToMs $(ffprobe -v quiet \
+		-show_entries format=duration -of csv="p=0" -i "Media/$file"))
+	# Determine the chapter pattern.
+	chapterPattern=$(getChapterPattern "Media/$file")
+	# First, extract the selected chapter times.
+	# Use the specified "full audio" stream for this.
+	if [[ "$FULL_AUDIO" -eq 1 ]]
+	then
+		if [[ -z "$startTrimMs" ]]
+		then
+			# The user specified which chapters to use for this chapter pattern.
+			readChapterTimes "Media/$file" "${chaptersFull[$chapterPattern]}"
+		else
+			# The user specified a static start trim time and end trim time.
+			# Convert these into a "chapter" based on the length of the media file.
+			chapterTimes=$(echo "$startTrimMs;$(($mediaLengthMs - $endTrimMs));")
+		fi
+		echo "Extracting full audio from $file. Sections: "$(echo "$chapterTimes" | wc -l)
+		filter=$(buildAudioTrimFilter "$chapterTimes" "a:$audioStreamFull")
+		ffmpeg -v error -i "Media/$file" -map_metadata -1 -map_chapters -1 \
+			-filter_complex "$filter;[trimmedAudio]$FULL_AUDIO_FILTER[finalAudio]" \
+			-map "[finalAudio]" -b:a "$FULL_AUDIO_BITRATE" \
+			-metadata album="$MEDIA_ID" -metadata title="${file%.*}" \
+			-metadata genre="Immersion (Full)" \
+			"Audio/${file%.*}$FULL_AUDIO_EXTENSION"
+	fi
+	# Then, extract padded subtitle times within the selected chapter times.
+	# Use the specified "condensed audio" stream for this.
+	if [[ "$CONDENSED_AUDIO" -eq 1 ]]
+	then
+		if [[ -z "$startTrimMs" ]]
+		then
+			# The user specified which chapters to use for this chapter pattern.
+			readChapterTimes "Media/$file" "${chaptersCondensed[$chapterPattern]}"
+		else
+			# The user specified a static start trim time and end trim time.
+			# Convert these into a "chapter" based on the length of the media file.
+			chapterTimes=$(echo "$startTrimMs;$(($mediaLengthMs - $endTrimMs));")
+		fi
+		# Determine the set of subtitles lying inside one of the selected chapters.
+		# (And, after padding, merge overlapping subtitles for a smaller result set.)
+		condensedTimes=$(grep " --> " "Subtitles/${file%.*}.srt" | sed "s/ --> /\n/g" | {
+			lastStartMs=0; lastEndMs=0;
+			while read startTimestamp; do
+				read endTimestamp
+				unset consider
+				startMs=$(timestampToMs "$startTimestamp")
+				endMs=$(timestampToMs "$endTimestamp")
+				if [ $(($endMs - $startMs)) -lt "$CONDENSED_AUDIO_MINIMUM_LENGTH" ]; then
+					# This subtitle is too short, ignore it.
+					continue
+				fi
+				for timespan in $(echo "$chapterTimes" | tac); do
+					if [ "${timespan%%;*}" -le "$startMs" ]; then
+						# Found the last chapter that starts before the subtitle!
+						# Check if the subtitle ends within this chapter...
+						endChapterSlice="${timespan#*;}"
+						endChapterMs="${endChapterSlice%%;*}"
+						if [ "$endMs" -le "$endChapterMs" ]; then
+							# The subtitle lies within a selected chapter.
+							# Continue its analysis after this loop.
+							consider=1
+							break
+						fi
+					fi
+				done
+				if [ ! -z "$consider" ]; then
+					# Audio for this subtitle will be extracted.
+					# Calculate the padding and check for overlaps.
+					# Think of lastEndMs as already being set in stone.
+					# Only adjust the start time of the current subtitle.
+					# (It is okay if the padded end time exceeds the stream.)
+					# (In this case, the atrim filter will just stop earlier.)
+					startMsPadded=$(($startMs - $CONDENSED_AUDIO_PADDING))
+					endMsPadded=$(($endMs + $CONDENSED_AUDIO_PADDING))
+					if [ "$startMsPadded" -le "$lastEndMs" ]; then
+						# Overlap! Extend the last subtitle by this one.
+						# Its start time will now be in the output twice.
+						# But this is okay, the last one will be used.
+						echo "$lastStartMs;$endMsPadded;"
+						lastEndMs=$endMsPadded
+					else
+						# No overlap, output the padded times.
+						echo "$startMsPadded;$endMsPadded;"
+						lastStartMs=$startMsPadded
+						lastEndMs=$endMsPadded
+					fi
+				fi
+			done
+		} | tac | awk -F ";" 'BEGIN{
+			previousStartMs = -1;
+		}{
+			if ($1 != previousStartMs) {
+				# Only print timespans if the start time is different from before.
+				# This only keeps the "last" timespan of start time duplicates.
+				previousStartMs = $1;
+				print;
+			}
+		}' | tac)
+		echo "Extracting condensed audio from $file. Sections: "$(echo "$condensedTimes" | wc -l)
+		filter=$(buildAudioTrimFilter "$condensedTimes" "a:$audioStreamCondensed")
+		ffmpeg -v error -i "Media/$file" -map_metadata -1 -map_chapters -1 \
+			-filter_complex "$filter;[trimmedAudio]$CONDENSED_AUDIO_FILTER[finalAudio]" \
+			-map "[finalAudio]" -b:a "$CONDENSED_AUDIO_BITRATE" \
+			-metadata album="Immersion (Condensed)" -metadata title="${file%.*}" \
+			-metadata genre="Immersion (Condensed)" \
+			"Audio/Condensed/${file%.*}$CONDENSED_AUDIO_EXTENSION"
+	fi
+done
+unset IFS
+# Finally, create one big Anki deck from this piece of media.
+if [[ "$DECK" -eq 1 ]]
+then
+	cd Media
+	IFS=$'\n'
+	for file in $(ls -1A 2> /dev/null)
+	do
+		if [[ "$file" =~ \.srt$ ]]
+		then
+			# Ignore the (link to the) cleaned subtitle, which is in the same folder.
+			continue
+		fi
+		# Run substudy with each media file and its (link to the) cleaned subtitle.
+		echo "Creating Anki deck for ${file%.*}..."
+		substudy export csv "$file" "${file%.*}.srt"
+	done
+	unset IFS
+	# Unify the extracted Anki media (which was done per file) in one place.
+	mv *_csv/*.{mp3,jpg} ../collection.media/
+	# Unify the card data (also stored per file) in one file for easy import.
+	tail -qn +2 *_csv/cards.csv \
+		| awk -v fieldOrder="$ANKI_FIELD_ORDER" \
+				-v tagPrefix="$ANKI_TAG_PREFIX" \
+				-v extraTags="$ANKI_EXTRA_TAGS" \
+				-v mediaID="$MEDIA_ID" 'BEGIN{
+			OFS = FS = ",";
+			fieldCount = split(fieldOrder, fields);
+		}function buildRec(i, orig, fpat, done) {
+			# WHAT?! All I wanted was to parse CSV...
+			# Source: https://stackoverflow.com/a/45420607
+			$0 = PrevSeg $0;
+			if ( gsub(/"/,"&") % 2 ) {
+				PrevSeg = $0 RS; done = 0;
+			} else {
+				PrevSeg = ""; gsub(/@/,"@A");
+				gsub(/""/,"@B"); orig = $0; $0 = "";
+				fpat = "([^" FS "]*)|(\"[^\"]+\")";
+				while ( (orig!="") && match(orig,fpat) ) {
+					$(++i) = substr(orig,RSTART,RLENGTH);
+					gsub(/@B/,"\"\"",$i); gsub(/@A/,"@",$i);
+					orig = substr(orig,RSTART+RLENGTH+1);
+				}
+				done = 1;
+			}
+			return done;
+		}!buildRec() { next }{
+			# Reassemble each row in the specified field order.
+			for (i = 1; i <= fieldCount; i++) {
+				# Write the field specified at this position in fieldOrder.
+				# (Do not forget that 0 means empty as in "", and not $0)
+				printf "%s%s", (fields[i] > 0) ? $fields[i] : "", OFS;
+			}
+			# Write the tags (media and extra) at the end of each row.
+			sep = length(extraTags) > 0 ? " " : "";
+			printf "%s%s%s%s%s", tagPrefix, mediaID, sep, extraTags, ORS;
+		}' > ../cards.csv
+	# Clean up the intermediate files by substudy.
+	rm -R ./*_csv/
+	cd ..
+fi
+# Done! Move the audio files and export the deck to Anki.
+echo "Finished processing $MEDIA_ID."
+if [[ "$MOVE_AUDIO" -eq 1 ]]
+then
+	fullAudioFiles=$(ls -1A ./Audio/*"$FULL_AUDIO_EXTENSION" 2> /dev/null)
+	# Only create the target directory if full audio files have been generated.
+	if [[ -d "$FULL_AUDIO_PATH" && ! -z "$fullAudioFiles" ]]
+	then
+		mkdir "$FULL_AUDIO_PATH/$MEDIA_ID"
+		IFS=$'\n';
+		for file in $fullAudioFiles
+		do
+			# Move each full audio file, but keep a link.
+			mv "$file" "$FULL_AUDIO_PATH/$MEDIA_ID/"
+			fileLink "$FULL_AUDIO_PATH/$MEDIA_ID/${file##*/}" "$file"
+		done
+		unset IFS
+	else
+		echo "The given full audio path ($FULL_AUDIO_PATH) does not exist."
+		echo "Please manually move files from "$(realpath .)"/Audio/."
+	fi
+	if [[ -d "$CONDENSED_AUDIO_PATH" ]]
+	then
+		IFS=$'\n';
+		for file in $(ls -1A ./Audio/Condensed/*"$CONDENSED_AUDIO_EXTENSION" 2> /dev/null)
+		do
+			# Move each condensed audio file, but keep a link.
+			mv "$file" "$CONDENSED_AUDIO_PATH/"
+			fileLink "$CONDENSED_AUDIO_PATH/${file##*/}" "$file"
+		done
+		unset IFS
+	else
+		echo "The given condensed audio path ($CONDENSED_AUDIO_PATH) does not exist."
+		echo "Please manually move files from "$(realpath .)"/Audio/Condensed/."
+	fi
+fi
+if [[ "$ANKI_EXPORT" -eq 1 ]]
+then
+	if [[ -d "$ANKI_MEDIA_PATH" ]]
+	then
+		# Create a media file backup, this can come in really handy later on.
+		# (When not syncing all media, this can help in the case of data loss.)
+		# (And it makes sense to not sync most of the media until it becomes useful.)
+		echo "Please wait until all Anki media has been backed up and moved..."
+		echo "(Due to the usually large number of files, this takes time.)"
+		# Use fast, parallel compression if available on the system...
+		backupPath="./collection.media/$MEDIA_ID.tar.gz"
+		if [ -z "$(command -v pigz)" ]
+		then
+			tar -czf "$backupPath" ./collection.media/*.{mp3,jpg}
+		else
+			tar -c ./collection.media/*.{mp3,jpg} | pigz > "$backupPath"
+		fi
+		# With the backup finished, move all media files into the Anki media folder.
+		mv ./collection.media/*.{mp3,jpg} "$ANKI_MEDIA_PATH/"
+		echo "Finished moving Anki media."
+	else
+		echo "The given Anki media path ($ANKI_MEDIA_PATH) does not exist."
+		echo "Please manually move files from "$(realpath .)"/collection.media/."
+	fi
+	sleep 1
+	# If enabled, wait until the user is ready for import.
+	# The Anki browser needs to be closed for it to work!
+	if [[ "$IMMEDIATE_IMPORT" -eq 0 ]]
+	then
+		read -p "Please close all Anki windows but the main window and press enter."
+	fi
+	anki "$(realpath ./cards.csv)"
+fi
+
+exit 0
