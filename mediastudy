@@ -9,25 +9,6 @@
 
 # You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-# Features:
-# - Bulk processing of series with any amount of episodes or generally split-up media
-# - Audio extraction for background listening in two versions, full and condensed
-#   Full: All audio except selected chapters or start and end trim times (optional)
-#   Condensed: Audio with speech (detected using subtitles) except the above (optional)
-#   Simple, interactive selection of desired chapters and audio and subtitle streams
-#   Adjustable padding per sentence for condensed audio for a less chopped up result
-#   Dynamic audio normalization for better audibility (and a less annoying experience)
-#   Automatic ID3 tagging of audio files for clean import into audio collections
-# - Anki deck creation from media files and subtitles (using substudy by emk)
-#   Automatic subtitle extraction from media file or import of external subtitle file
-#   Linear, static time shift of subtitles not from within (or nearby) media file
-#   Automatic alignment of mistimed subtitles to others (using alass by kaegi)
-#   Custom field output for seamless Anki import with correct mapping on card type
-#   Auto-import into Anki and audio file move e.g. into a cloud-synchronized folder
-# - Subtitle preprocessing (validation and repair) to ensure substudy will parse
-# - Clear intermediate folder structure and efficient file management using hardlinks
-#   This makes previewing the final subtitles and debugging the process easier
-
 HELP_TEXT='
 Usage: mediastudy [OPTIONS]
 By default, the current working directory will be searched for media files.
