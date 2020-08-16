@@ -837,7 +837,7 @@ do
 		fi
 		# Determine the set of subtitles lying inside one of the selected chapters.
 		# (And, after padding, merge overlapping subtitles for a smaller result set.)
-		condensedTimes=$(grep " --> " "Subtitles/${file%.*}.srt" | sed "s/ --> /\n/g" | {
+		condensedTimes=$(grep " --> " "Media/${file%.*}.srt" | sed "s/ --> /\n/g" | {
 			lastStartMs=0; lastEndMs=0;
 			while read startTimestamp; do
 				read endTimestamp
