@@ -91,6 +91,11 @@ The following arguments can be specified:
 # (anki, but only if the user requests to export the finished deck.)
 # Other tools used: awk, sed, sort, uniq, tac, tar, md5sum...
 
+# We will be working with '.' as the radix character.
+# Without this, the locale may mess up floating point conversion.
+# (Decimal points other than '.' will break ffmpeg's filter strings!)
+LC_NUMERIC=C
+
 # INPUT CONFIGURATION
 VIDEO_EXTENSIONS=(
 	'mkv'
