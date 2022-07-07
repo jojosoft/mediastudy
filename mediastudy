@@ -106,7 +106,7 @@ SUBTITLE_EXTENSIONS=(
 	'ass'
 	'ssa'
 )
-# Whether to keep subtitle lines which contain a ♪.
+# Whether to keep subtitle lines which contain a ♪ or ♬.
 SRT_MUSIC=0
 # Whether to keep subtitle text between { and }.
 # (Sometimes used for effects, it just sucks.)
@@ -313,7 +313,8 @@ function fixSubtitles {
 		gsub("^(\\\\N)+|(\\\\N)+$", "", $3);
 		# Drop invalid records. (Non-integer number, empty or containing a music note.)
 		# Empty subtitles can arise from the previous step removing all their content.
-		if (match($1, "^[0-9]+$") && (!match($0, "♪") || music) && length($3) > 0) {
+		foundMusic = match($0, "♪") || match($0, "♬");
+		if (match($1, "^[0-9]+$") && (!foundMusic || music) && length($3) > 0) {
 			$1 = ""; print;
 		}
 	}' | sort --stable --key=1.3,1.31 \
